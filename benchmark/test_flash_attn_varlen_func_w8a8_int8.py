@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import lru_cache
 from itertools import accumulate
+from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 import flaggems_vllm
+from tests.accuracy_utils import gems_assert_close
+from tools.benchmark_metax_int8_real_shapes import build, read_captured_shape
 
+from . import conftest as benchmark_config
+from .consts import BenchLevel
 from .test_flash_attn_varlen_func import FlashAttnVarlenBenchmark
 
 try:
@@ -40,12 +47,45 @@ vendor_name = flaggems_vllm.vendor_name
 
 
 class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
-    """vLLM v0.19.0 standard attention workloads with the Gems benchmark runner."""
+    """Standard workloads and captured INT8 requests using the benchmark runner."""
+
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
 
     def set_shapes(self, shape_file_path=None):
+        self.captured_shapes = []
+        default_path = Path(self.DEFAULT_SHAPE_FILES)
+        path = Path(shape_file_path) if shape_file_path else default_path
+        if vendor_name == "thead":
+            if path.resolve() == default_path.resolve():
+                # Reuse the existing Qwen3.6 D256 representative workloads.
+                super().set_shapes(str(path))
+                return
+            with path.open() as stream:
+                data = yaml.safe_load(stream)
+            if isinstance(data, list):
+                entries = data
+            else:
+                entries = data["FlashAttnVarlenInt8Benchmark"]["captured_shapes"]
+            # A shape may occur in several capture sources. Merge before ranking.
+            merged = {}
+            for index, entry in enumerate(entries):
+                read_captured_shape(entry)
+                key = (entry["labels"], tuple(entry["shape"]))
+                if key in merged:
+                    merged[key]["count"] += entry["count"]
+                else:
+                    merged[key] = dict(entry, index=entry.get("index", index))
+            self.captured_shapes = sorted(
+                merged.values(), key=lambda entry: (-entry["count"], entry["index"])
+            )
+            if benchmark_config.Config.bench_level == BenchLevel.CORE:
+                self.captured_shapes = self.captured_shapes[:10]
+            # Explicit capture files define the entire requested workload.
+            self.shapes = []
+            return
         # vllm/benchmarks/attention_benchmarks/configs/standard_attention.yaml
         # Each group is (request count, query length, total KV length).
-        # Keep all 18 workloads in both core and comprehensive modes.
+        # Preserve historical D128 coverage on the other backends.
         workloads = [
             ((1, 512, 512),),
             ((1, 2048, 2048),),
@@ -76,6 +116,8 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
 
     def flash_attn_varlen_input_fn(self, config, dtype, device):
         args = list(super().flash_attn_varlen_input_fn(config, dtype, device))
+        if vendor_name == "thead":
+            return tuple(args)
         # Match vLLM runner._build_common_attn_metadata: distinct sequential
         # cache blocks per request, including unused slots for shorter requests.
         batch = len(config[1])
@@ -85,7 +127,7 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
         return tuple(args)
 
     def get_input_iter(self, dtype):
-        if vendor_name == "metax":
+        if vendor_name in ("metax", "thead"):
             torch.manual_seed(0)
         for bf16_args in super().get_input_iter(dtype):
             q, k, v = bf16_args[:3]
@@ -160,17 +202,160 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             # Check the same quantized values, separating kernel error from
             # input quantization error. Timing still uses the original BF16 inputs.
             reference_args = (*dequantized, *bf16_args[3:])
-            if vendor_name == "thead":
+            if vendor_name == "ascend":
+                page = k.shape[1]
+                metadata = dict(
+                    bf16_args[-1],
+                    q_cum=bf16_args[4][1:].cpu().tolist(),
+                    k_cum=bf16_args[7].cpu().tolist(),
+                    block_size=page,
+                    fia_scale=bf16_args[10],
+                )
+                baseline = _fia(
+                    dequantized[0],
+                    dequantized[1].permute(0, 2, 1, 3).contiguous(),
+                    dequantized[2].permute(0, 2, 1, 3).contiguous(),
+                    bf16_args[17],
+                    metadata["q_cum"],
+                    metadata["k_cum"],
+                    page,
+                    metadata["fia_scale"],
+                )
+                bf16_args = (
+                    q,
+                    k.permute(0, 2, 1, 3).contiguous(),
+                    v.permute(0, 2, 1, 3).contiguous(),
+                    *bf16_args[3:-1],
+                    metadata,
+                )
+            elif vendor_name == "thead":
                 baseline = _varlen_fa3_baseline(reference_args, int8_args)
             else:
                 baseline = _varlen_bf16_baseline(reference_args, int8_args)
-            torch.testing.assert_close(
-                _varlen_int8(bf16_args, int8_args),
+            actual = _varlen_int8(bf16_args, int8_args)
+            gems_assert_close(
+                actual,
                 baseline,
+                dtype=actual.dtype,
+                atol=0.03,
+                rtol=0.03 if vendor_name == "thead" else None,
+            )
+            yield bf16_args, int8_args
+
+        for entry in self.captured_shapes:
+            captured = build(entry, entry["index"], torch)
+            dims = captured["d"]
+            metadata = get_scheduler_metadata(
+                batch_size=len(captured["qlens"]),
+                max_seqlen_q=dims["max_seqlen_q"],
+                max_seqlen_k=dims["max_seqlen_k"],
+                num_heads_q=dims["q_dim1"],
+                num_heads_kv=dims["k_dim2"],
+                headdim=dims["q_dim2"],
+                cache_seqlens=captured["used"],
+                qkv_dtype=dtype,
+                cu_seqlens_q=captured["cuq"],
+                page_size=dims["k_dim1"],
+                causal=bool(dims["causal"]),
+                num_splits=dims["num_splits"],
+            )
+            # Keep captured bounds and split hints independent of actual lengths.
+            common = (
+                dims["max_seqlen_q"],
+                captured["cuq"],
+                dims["max_seqlen_k"],
+                None,
+                captured["used"],
+                None,
+                0.0,
+                dims["q_dim2"] ** -0.5,
+                bool(dims["causal"]),
+                (-1, -1),
+                0.0,
+                None,
+                False,
+                False,
+                captured["table"],
+                False,
+            )
+            output = torch.empty_like(captured["bf16"][0])
+            options = dict(scheduler_metadata=metadata, num_splits=dims["num_splits"])
+            bf16_args = (
+                *captured["bf16"],
+                *common,
+                torch.empty_like(output),
+                options,
+            )
+            int8_args = (
+                *captured["qkv"],
+                *common,
+                output,
+                dict(
+                    options,
+                    q_descale=captured["descales"][0],
+                    k_descale=captured["descales"][1],
+                    v_descale=captured["descales"][2],
+                    fa_version=2,
+                ),
+            )
+            gems_assert_close(
+                _varlen_int8(bf16_args, int8_args),
+                _varlen_fa3_baseline(bf16_args, int8_args),
+                dtype=dtype,
                 atol=0.03,
                 rtol=0.03,
             )
-            yield bf16_args, int8_args
+            # Record counts and exact vectors through Benchmark.record_shapes.
+            yield bf16_args, int8_args, {
+                "capture": {
+                    "index": entry["index"],
+                    "count": entry["count"],
+                    "qlens": captured["qlens"],
+                    "klens": captured["klens"],
+                    "num_splits": dims["num_splits"],
+                }
+            }
+
+
+@lru_cache(maxsize=1)
+def _causal_mask(device):
+    return torch.triu(torch.ones(2048, 2048, device=device), diagonal=1).to(torch.int8)
+
+
+def _fia(query, key, value, table, q_cum, k_cum, block_size, scale):
+    import torch_npu
+
+    output, _ = torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        atten_mask=_causal_mask(query.device),
+        block_table=table,
+        input_layout="TND",
+        block_size=block_size,
+        actual_seq_lengths=q_cum,
+        actual_seq_lengths_kv=k_cum,
+        num_key_value_heads=key.shape[1],
+        num_heads=query.shape[1],
+        scale=scale,
+        sparse_mode=3,
+    )
+    return output
+
+
+def _varlen_ascend_baseline(bf16_args, _int8_args):
+    query, key, value = bf16_args[:3]
+    meta = bf16_args[-1]
+    return _fia(
+        query,
+        key,
+        value,
+        bf16_args[17],
+        meta["q_cum"],
+        meta["k_cum"],
+        meta["block_size"],
+        meta["fia_scale"],
+    )
 
 
 def _varlen_bf16_baseline(bf16_args, int8_args):
@@ -196,20 +381,21 @@ def _varlen_bf16_baseline(bf16_args, int8_args):
     return flaggems_vllm.flash_attn_varlen_func(*bf16_args[:-1], **bf16_args[-1])
 
 
-def _varlen_fa3_baseline(bf16_args, int8_args):
+def _varlen_fa3_baseline(bf16_args, int8_args, capture=None):
     return vllm_flash_attn_varlen_func(
         *bf16_args[:-1],
         scheduler_metadata=bf16_args[-1]["scheduler_metadata"],
+        num_splits=bf16_args[-1]["num_splits"],
         fa_version=3,
     )
 
 
-def _varlen_int8(bf16_args, int8_args):
+def _varlen_int8(bf16_args, int8_args, capture=None):
     return flaggems_vllm.flash_attn_varlen_func(*int8_args[:-1], **int8_args[-1])
 
 
 @pytest.mark.skipif(
-    vendor_name not in ("hygon", "thead", "metax"),
+    vendor_name not in ("hygon", "thead", "metax", "ascend"),
     reason="INT8 attention backend unavailable",
 )
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -219,6 +405,9 @@ def test_flash_attn_varlen_func_w8a8_int8():
             pytest.skip("PPU vLLM FA3 is unavailable")
         print("Baseline: vLLM BF16 FA3; scheduler setup and quantization excluded.")
         baseline = _varlen_fa3_baseline
+    elif vendor_name == "ascend":
+        print("Baseline: vLLM-Ascend BF16 FIA; input quantization excluded.")
+        baseline = _varlen_ascend_baseline
     elif vendor_name == "metax":
         print("Baseline: vLLM-MetaX BF16 FA2; metadata and quantization excluded.")
         baseline = _varlen_bf16_baseline
